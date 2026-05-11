@@ -1,0 +1,757 @@
+// ============================================================
+// Woody Feed Indicator -- Phase 1 v6
+// ============================================================
+// LED States:
+//   Outside window, not fed         : Orange
+//   Outside window, fed             : Orange + Green
+//   In window, not fed              : Red
+//   In window, not fed (tablet day) : Red + Blue
+//   In window, fed                  : Green
+//   In window, fed, tablet pending  : Green + Blue
+//   After reset                     : Orange
+//
+// OLED shows: name, time, date, WiFi status, feed status
+// WiFi and NTP are retried at startup until successful
+// Once NTP is synced, internal clock runs independently
+// NTP resyncs daily at 03:00 to correct drift
+// WiFi reconnects silently in background if dropped
+// ============================================================
+
+
+// --- Debug Flags ---
+// DEBUG_SIM : true  = use simulated clock/date and Wokwi WiFi credentials
+//             false = use NTP time and real WiFi credentials
+// DEBUG_LOG : true  = enable verbose serial output (independent of DEBUG_SIM)
+#define DEBUG_SIM false
+#define DEBUG_LOG true
+
+
+// --- Feature Flags ---
+#define TABLET_FEATURE true   // Set to false to disable tablet tracking entirely
+
+
+// --- Includes ---
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <time.h>
+
+
+// --- Pin Definitions ---
+#define PIN_GREEN  18
+#define PIN_RED    19
+#define PIN_ORANGE 25
+#define PIN_BLUE   26
+#define PIN_BTN     4
+
+// OLED uses hardware I2C: SDA = 21, SCL = 22 (ESP32 default)
+#define OLED_WIDTH   128
+#define OLED_HEIGHT   64
+#define OLED_ADDRESS 0x3C
+#define OLED_RESET    -1
+
+
+// ============================================================
+// --- Configurable Settings ---
+
+// Dog's name
+#define DOG_NAME "Woody"
+
+// Timezone and NTP
+#define TIMEZONE   "GMT0BST,M3.5.0/1,M10.5.0"
+#define NTP_SERVER "pool.ntp.org"
+
+// NTP daily resync time
+#define NTP_RESYNC_HOUR   3
+#define NTP_RESYNC_MINUTE 0
+
+// WiFi retry interval in milliseconds
+#define WIFI_RETRY_MS 30000
+
+// WiFi credentials
+// DEBUG_SIM true  : uses Wokwi guest network
+// DEBUG_SIM false : uses real credentials
+#if DEBUG_SIM
+  #define WIFI_SSID "Wokwi-GUEST"
+  #define WIFI_PASS ""
+#else
+  #define WIFI_SSID "your_wifi_ssid"   // Replace with your WiFi name
+  #define WIFI_PASS "your_wifi_pass"   // Replace with your WiFi password
+#endif
+
+// Feeding windows
+struct FeedWindow {
+  int  startH, startM;
+  int  endH,   endM;
+  bool enabled;
+};
+
+const FeedWindow WINDOWS[] = {
+  {  6,  0,  8,  0, true  },   // Morning
+  { 12,  0, 13,  0, false },   // Optional lunch window (disabled)
+  { 17, 30, 20,  0, true  }    // Evening
+};
+const int NUM_WINDOWS = 3;
+
+const char* WINDOW_NAMES[] = { "Morning", "Lunch", "Evening" };
+
+// Reset times
+struct ResetTime {
+  int  h, m;
+  bool enabled;
+  bool clearTablet;
+};
+
+const ResetTime RESETS[] = {
+  { 11, 30, true,  false },   // After morning feed -- does not clear tablet
+  { 15,  0, false, false },   // Optional lunch reset (disabled)
+  { 23, 30, true,  true  }    // End of day -- clears tablet state
+};
+const int NUM_RESETS = 3;
+
+// Tablet settings
+#define TABLET_DAY    1
+#define TABLET_WINDOW 0   // 0 = morning window
+
+// Simulated time and date -- only used when DEBUG_SIM is true
+#define SIM_DAY    1
+#define SIM_HOUR   5
+#define SIM_MINUTE 50
+
+
+// ============================================================
+// --- OLED Instance ---
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+
+
+// ============================================================
+// --- State ---
+bool fed           = false;
+bool tabletGiven   = false;
+bool resetDone     = false;
+bool windowMissed  = false;   // True if a feed window closed without Woody being fed
+int  btnPressCount = 0;
+bool wifiConnected = false;
+bool timeSynced    = false;
+int  lastFedHour   = -1;
+int  lastFedMinute = -1;
+
+// NTP resync tracking
+bool ntpResyncDone = false;
+
+// WiFi background reconnect tracking
+unsigned long lastWifiRetry    = 0;
+bool          lastWifiState    = false;
+
+// Simulated time (DEBUG_SIM only)
+#if DEBUG_SIM
+  int simDay    = SIM_DAY;
+  int simHour   = SIM_HOUR;
+  int simMinute = SIM_MINUTE;
+  unsigned long lastTick = 0;
+  const unsigned long TICK_MS = 100;
+#endif
+
+// Window transition tracking
+int lastActiveWindow = -2;
+
+// Button
+int lastBtnState = HIGH;
+
+
+// ============================================================
+// --- Time Access ---
+
+void getCurrentTime(int* hour, int* minute, int* day) {
+  #if DEBUG_SIM
+    *hour   = simHour;
+    *minute = simMinute;
+    *day    = simDay;
+  #else
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      *hour   = timeinfo.tm_hour;
+      *minute = timeinfo.tm_min;
+      *day    = timeinfo.tm_mday;
+    } else {
+      *hour = 0; *minute = 0; *day = 0;
+      logPrint("WARNING: Failed to read local time.");
+    }
+  #endif
+}
+
+void getDateString(char* buf, int bufLen) {
+  #if DEBUG_SIM
+    snprintf(buf, bufLen, "Day %02d (sim)", simDay);
+  #else
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      strftime(buf, bufLen, "%a %d/%m/%Y", &timeinfo);
+    } else {
+      snprintf(buf, bufLen, "Date unavailable");
+    }
+  #endif
+}
+
+void getTimeString(char* buf, int bufLen) {
+  int h, m, d;
+  getCurrentTime(&h, &m, &d);
+  snprintf(buf, bufLen, "%02d:%02d", h, m);
+}
+
+
+// ============================================================
+// --- Helpers ---
+
+int toMins(int h, int m) { return h * 60 + m; }
+
+int activeFeedWindow() {
+  int h, m, d;
+  getCurrentTime(&h, &m, &d);
+  int now = toMins(h, m);
+  for (int i = 0; i < NUM_WINDOWS; i++) {
+    if (!WINDOWS[i].enabled) continue;
+    if (now >= toMins(WINDOWS[i].startH, WINDOWS[i].startM) &&
+        now <  toMins(WINDOWS[i].endH,   WINDOWS[i].endM)) return i;
+  }
+  return -1;
+}
+
+bool inFeedingWindow() { return activeFeedWindow() != -1; }
+
+bool isTabletWindow() {
+  #if TABLET_FEATURE
+    return activeFeedWindow() == TABLET_WINDOW;
+  #else
+    return false;
+  #endif
+}
+
+bool isTabletDay() {
+  #if TABLET_FEATURE
+    int h, m, d;
+    getCurrentTime(&h, &m, &d);
+    return d == TABLET_DAY;
+  #else
+    return false;
+  #endif
+}
+
+bool isResetTime() {
+  int h, m, d;
+  getCurrentTime(&h, &m, &d);
+  int now = toMins(h, m);
+  for (int i = 0; i < NUM_RESETS; i++) {
+    if (!RESETS[i].enabled) continue;
+    if (now == toMins(RESETS[i].h, RESETS[i].m)) return true;
+  }
+  return false;
+}
+
+
+// ============================================================
+// --- Serial Logging ---
+
+void logPrint(const char* msg) {
+  #if DEBUG_LOG
+    Serial.println(msg);
+  #endif
+}
+
+void logTime(const char* prefix) {
+  #if DEBUG_LOG
+    int h, m, d;
+    getCurrentTime(&h, &m, &d);
+    Serial.printf("%s%02d:%02d (day %d)\n", prefix, h, m, d);
+  #endif
+}
+
+
+// ============================================================
+// --- LED Control ---
+
+void updateLED() {
+  if (!timeSynced) {
+    digitalWrite(PIN_GREEN,  LOW);
+    digitalWrite(PIN_RED,    LOW);
+    digitalWrite(PIN_ORANGE, HIGH);
+    digitalWrite(PIN_BLUE,   LOW);
+    return;
+  }
+
+  bool tabletPending = TABLET_FEATURE && isTabletDay() && isTabletWindow() && !tabletGiven;
+
+  if (inFeedingWindow()) {
+    // Inside feed window
+    digitalWrite(PIN_ORANGE, LOW);
+    digitalWrite(PIN_RED,    !fed ? HIGH : LOW);
+    digitalWrite(PIN_GREEN,  fed  ? HIGH : LOW);
+    digitalWrite(PIN_BLUE,   tabletPending ? HIGH : LOW);
+  } else if (fed) {
+    // Outside window, fed -- orange + green
+    digitalWrite(PIN_ORANGE, HIGH);
+    digitalWrite(PIN_RED,    LOW);
+    digitalWrite(PIN_GREEN,  HIGH);
+    digitalWrite(PIN_BLUE,   LOW);
+  } else if (windowMissed) {
+    // Outside window, missed a feed -- orange + red
+    digitalWrite(PIN_ORANGE, HIGH);
+    digitalWrite(PIN_RED,    HIGH);
+    digitalWrite(PIN_GREEN,  LOW);
+    digitalWrite(PIN_BLUE,   LOW);
+  } else {
+    // Outside window, no feed window has passed yet -- orange only
+    digitalWrite(PIN_ORANGE, HIGH);
+    digitalWrite(PIN_RED,    LOW);
+    digitalWrite(PIN_GREEN,  LOW);
+    digitalWrite(PIN_BLUE,   LOW);
+  }
+}
+
+
+// ============================================================
+// --- OLED ---
+
+void drawWifiIcon(int x, int y, int mode) {
+  display.setCursor(x, y);
+  if (mode == 0)      display.print("W");   // Connected
+  else if (mode == 1) display.print("S");   // Simulation
+  else                display.print("X");   // Disconnected
+}
+
+void oledStartup(const char* msg) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(DOG_NAME);
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.println(msg);
+  display.display();
+}
+
+void oledMessage(const char* line1, const char* line2 = nullptr) {
+  // Shows a two line message -- used for brief status screens
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println(line1);
+  if (line2) {
+    display.setCursor(0, 34);
+    display.println(line2);
+  }
+  display.display();
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // --- Row 1: Name, Time, WiFi icon ---
+  char timeBuf[6];
+  getTimeString(timeBuf, sizeof(timeBuf));
+  display.setCursor(0, 0);
+  display.print(DOG_NAME);
+  int iconX = OLED_WIDTH - 6;
+  int timeX = iconX - (strlen(timeBuf) * 6) - 2;
+  display.setCursor(timeX, 0);
+  display.print(timeBuf);
+  #if DEBUG_SIM
+    drawWifiIcon(iconX, 0, 1);
+  #else
+    drawWifiIcon(iconX, 0, wifiConnected ? 0 : 2);
+  #endif
+
+  // --- Row 2: Date ---
+  char dateBuf[20];
+  getDateString(dateBuf, sizeof(dateBuf));
+  display.setCursor(0, 12);
+  display.print(dateBuf);
+
+  // --- Divider ---
+  display.drawFastHLine(0, 22, OLED_WIDTH, SSD1306_WHITE);
+
+  // --- Feed status ---
+  if (!timeSynced) {
+    display.setCursor(0, 26);
+    display.print("Waiting for time sync");
+    display.display();
+    return;
+  }
+
+  int w = activeFeedWindow();
+  display.setCursor(0, 26);
+
+  if (w != -1) {
+    char windowBuf[24];
+    snprintf(windowBuf, sizeof(windowBuf), "%s feed time", WINDOW_NAMES[w]);
+    display.print(windowBuf);
+    display.setCursor(0, 38);
+    if (!fed) {
+      display.print("Not yet fed");
+    } else {
+      char fedBuf[32];
+      snprintf(fedBuf, sizeof(fedBuf), "%s fed at %02d:%02d", DOG_NAME, lastFedHour, lastFedMinute);
+      display.print(fedBuf);
+    }
+  } else {
+    display.print("Outside feed time");
+    display.setCursor(0, 38);
+    if (fed && lastFedHour != -1) {
+      char fedBuf[32];
+      snprintf(fedBuf, sizeof(fedBuf), "%s fed at %02d:%02d", DOG_NAME, lastFedHour, lastFedMinute);
+      display.print(fedBuf);
+    }
+  }
+
+  // --- Tablet row (tablet day only) ---
+  #if TABLET_FEATURE
+    if (isTabletDay()) {
+      display.setCursor(0, 52);
+      display.print(tabletGiven ? "Tablet: done" : "Tablet: due");
+    }
+  #endif
+
+  display.display();
+}
+
+
+// ============================================================
+// --- WiFi ---
+
+bool attemptWifiConnect() {
+  Serial.println("Scanning for networks...");
+  int n = WiFi.scanNetworks();
+  Serial.printf("%d networks found:\n", n);
+  for (int i = 0; i < n; i++) {
+    Serial.printf("  %s (%d dBm)\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+  }
+  WiFi.scanDelete();
+  delay(500);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to: '%s'\n", WIFI_SSID);
+  Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+    const char* statusStr;
+    switch (WiFi.status()) {
+      case WL_IDLE_STATUS:     statusStr = "Idle";            break;
+      case WL_NO_SSID_AVAIL:   statusStr = "SSID not found";  break;
+      case WL_SCAN_COMPLETED:  statusStr = "Scan complete";   break;
+      case WL_CONNECT_FAILED:  statusStr = "Connect failed";  break;
+      case WL_CONNECTION_LOST: statusStr = "Connection lost"; break;
+      case WL_DISCONNECTED:    statusStr = "Disconnected";    break;
+      default:                 statusStr = "Unknown";         break;
+    }
+    Serial.printf("Attempt %d/20 -- %s (%d)\n", attempts, statusStr, WiFi.status());
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool attemptNTPSync() {
+  configTzTime(TIMEZONE, NTP_SERVER);
+  Serial.println("Syncing NTP...");
+  struct tm timeinfo;
+  int attempts = 0;
+  while (!getLocalTime(&timeinfo) && attempts < 10) {
+    delay(500);
+    attempts++;
+    Serial.printf("NTP attempt %d/10...\n", attempts);
+  }
+  if (getLocalTime(&timeinfo)) {
+    char tbuf[30];
+    strftime(tbuf, sizeof(tbuf), "%H:%M:%S %d/%m/%Y %Z", &timeinfo);
+    Serial.printf("NTP synced: %s\n", tbuf);
+    return true;
+  }
+  return false;
+}
+
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_GREEN,  OUTPUT);
+  pinMode(PIN_RED,    OUTPUT);
+  pinMode(PIN_ORANGE, OUTPUT);
+  pinMode(PIN_BLUE,   OUTPUT);
+  pinMode(PIN_BTN,    INPUT_PULLUP);
+
+  // Initialise OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("OLED init failed -- check wiring.");
+    while (true);
+  }
+  display.clearDisplay();
+  display.display();
+
+  // --- LED diagnostic -- always runs at startup ---
+  int testPins[]        = { PIN_RED, PIN_GREEN, PIN_ORANGE, PIN_BLUE };
+  const char* testNames[] = { "Red", "Green", "Orange", "Blue" };
+  for (int i = 0; i < 4; i++) {
+    #if DEBUG_LOG
+      Serial.printf("Testing %s LED...\n", testNames[i]);
+    #endif
+    digitalWrite(testPins[i], HIGH);
+    delay(1000);
+    digitalWrite(testPins[i], LOW);
+  }
+  logPrint("LED diagnostic complete.");
+
+  #if DEBUG_SIM
+    timeSynced = true;
+    wifiConnected = true;
+    logPrint("Woody Feed Indicator started (SIMULATION MODE).");
+    logTime("Sim start: ");
+  #else
+    // --- WiFi: retry until connected ---
+    oledStartup("Connecting to WiFi...");
+    while (!wifiConnected) {
+      if (attemptWifiConnect()) {
+        wifiConnected = true;
+        char ipBuf[40];
+        snprintf(ipBuf, sizeof(ipBuf), "IP: %s", WiFi.localIP().toString().c_str());
+        Serial.printf("WiFi connected. %s, Signal: %d dBm\n",
+          ipBuf, WiFi.RSSI());
+        oledMessage("WiFi connected", ipBuf);
+        delay(2000);
+      } else {
+        Serial.println("WiFi failed -- retrying in 30s.");
+        oledStartup("WiFi failed.\nRetrying...");
+        delay(WIFI_RETRY_MS);
+      }
+    }
+
+    // --- NTP: retry until synced ---
+    oledStartup("Syncing time...");
+    while (!timeSynced) {
+      if (attemptNTPSync()) {
+        timeSynced = true;
+        oledMessage("Time synced.");
+        delay(2000);
+      } else {
+        Serial.println("NTP sync failed -- retrying in 30s.");
+        oledStartup("Time sync failed.\nRetrying...");
+        delay(WIFI_RETRY_MS);
+      }
+    }
+
+    lastWifiState = true;
+  #endif
+
+  updateLED();
+  updateOLED();
+}
+
+
+// ============================================================
+void loop() {
+  handleButton();
+
+  #if DEBUG_SIM
+    updateSimTime();
+  #else
+    checkWifiBackground();
+    checkNTPResync();
+  #endif
+
+  checkWindowTransition();
+  checkReset();
+  updateOLED();
+}
+
+
+// ============================================================
+// --- Button ---
+
+void handleButton() {
+  int reading = digitalRead(PIN_BTN);
+
+  if (reading != lastBtnState) {
+    #if DEBUG_LOG
+      Serial.printf("Button: %s\n", reading == LOW ? "LOW (pressed)" : "HIGH (released)");
+    #endif
+
+    if (reading == LOW) {
+      if (!inFeedingWindow()) {
+        logPrint("Button ignored -- outside feed time.");
+      } else if (!fed) {
+        fed = true;
+        btnPressCount = 1;
+        int h, m, d;
+        getCurrentTime(&h, &m, &d);
+        lastFedHour   = h;
+        lastFedMinute = m;
+        logTime("Fed button pressed and acknowledged at ");
+        updateLED();
+      } else if (TABLET_FEATURE && isTabletDay() && isTabletWindow() && !tabletGiven) {
+        tabletGiven = true;
+        btnPressCount = 2;
+        logTime("Tablet button pressed and acknowledged at ");
+        updateLED();
+      } else {
+        logPrint("Button ignored -- already fed and tablet complete.");
+      }
+    }
+  }
+
+  lastBtnState = reading;
+}
+
+
+// ============================================================
+// --- Background WiFi Reconnect ---
+
+void checkWifiBackground() {
+  #if !DEBUG_SIM
+    bool currentState = (WiFi.status() == WL_CONNECTED);
+
+    if (currentState != lastWifiState) {
+      if (currentState) {
+        logPrint("WiFi reconnected.");
+      } else {
+        logPrint("WiFi disconnected -- reconnecting in background.");
+      }
+      wifiConnected  = currentState;
+      lastWifiState  = currentState;
+    }
+
+    // Attempt reconnect if disconnected and retry interval has passed
+    if (!currentState && (millis() - lastWifiRetry > WIFI_RETRY_MS)) {
+      lastWifiRetry = millis();
+      logPrint("Retrying WiFi...");
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  #endif
+}
+
+
+// ============================================================
+// --- Daily NTP Resync ---
+
+void checkNTPResync() {
+  #if !DEBUG_SIM
+    int h, m, d;
+    getCurrentTime(&h, &m, &d);
+    bool isResyncTime = (h == NTP_RESYNC_HOUR && m == NTP_RESYNC_MINUTE);
+
+    if (isResyncTime && !ntpResyncDone && wifiConnected) {
+      ntpResyncDone = true;
+      logPrint("Daily NTP resync...");
+      if (attemptNTPSync()) {
+        logPrint("Daily NTP resync complete.");
+      } else {
+        logPrint("Daily NTP resync failed.");
+      }
+    }
+    if (!isResyncTime) ntpResyncDone = false;
+  #endif
+}
+
+
+// ============================================================
+// --- Window Transition ---
+
+void checkWindowTransition() {
+  int currentWindow = activeFeedWindow();
+
+  if (currentWindow != lastActiveWindow) {
+    // Window just closed
+    if (lastActiveWindow != -1 && lastActiveWindow != -2 && currentWindow == -1) {
+      if (!fed) {
+        windowMissed = true;
+        logPrint("Feed window closed -- Woody was not fed.");
+      } else {
+        logPrint("Feed window closed -- Woody was fed.");
+      }
+      updateLED();
+    }
+
+    // Window just opened
+    #if DEBUG_LOG
+      if (currentWindow != -1) {
+        int h, m, d;
+        getCurrentTime(&h, &m, &d);
+        Serial.printf("%s feed time opened at %02d:%02d\n",
+          WINDOW_NAMES[currentWindow], h, m);
+        if (TABLET_FEATURE && isTabletDay() && currentWindow == TABLET_WINDOW) {
+          logPrint("Tablet day -- two button presses required.");
+        }
+      }
+    #endif
+    lastActiveWindow = currentWindow;
+  }
+}
+
+
+// ============================================================
+// --- Simulated Clock (DEBUG_SIM only) ---
+
+#if DEBUG_SIM
+void updateSimTime() {
+  if (millis() - lastTick >= TICK_MS) {
+    lastTick = millis();
+    simMinute++;
+    if (simMinute >= 60) {
+      simMinute = 0;
+      simHour++;
+      if (simHour >= 24) {
+        simHour = 0;
+        simDay++;
+      }
+    }
+    updateLED();
+    #if DEBUG_LOG
+      if (simMinute == 0) {
+        Serial.printf("Simulated time: %02d:%02d (day %d)\n", simHour, simMinute, simDay);
+      }
+    #endif
+  }
+}
+#endif
+
+
+// ============================================================
+// --- Reset ---
+
+void checkReset() {
+  if (isResetTime() && !resetDone) {
+    resetDone = true;
+
+    int h, m, d;
+    getCurrentTime(&h, &m, &d);
+    int now = toMins(h, m);
+    bool shouldClearTablet = false;
+    for (int i = 0; i < NUM_RESETS; i++) {
+      if (!RESETS[i].enabled) continue;
+      if (now == toMins(RESETS[i].h, RESETS[i].m)) {
+        shouldClearTablet = RESETS[i].clearTablet;
+        break;
+      }
+    }
+
+    if (fed || windowMissed || (tabletGiven && shouldClearTablet)) {
+      logTime("Reset at ");
+      fed           = false;
+      windowMissed  = false;
+      btnPressCount = 0;
+      lastFedHour   = -1;
+      lastFedMinute = -1;
+      if (shouldClearTablet) {
+        tabletGiven = false;
+        logPrint("Tablet state cleared.");
+      }
+      updateLED();
+    }
+  }
+  if (!isResetTime()) resetDone = false;
+}
