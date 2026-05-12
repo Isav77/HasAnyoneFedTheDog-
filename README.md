@@ -15,7 +15,7 @@ Built as a practical solution to the household problem of not knowing if the dog
 - **Auto-reset** at configured times to clear feed status for the next meal
 - **Missed feed indicator** -- orange and red LEDs if a feed window closes without a feed
 - **Tablet reminder** -- blue LED and display prompt on a configured day of the month
-- **Push notifications** via ntfy.sh for fed, tablet due, tablet given, and optionally missed feed
+- **Temperature and humidity monitoring** via DHT11 sensor, displayed on OLED and logged hourly to serial
 - **Wi-Fi and NTP** for accurate timekeeping with daily resync and background reconnection
 - **Simulation mode** for testing without real hardware using Wokwi
 - **Debug logging** via serial monitor
@@ -64,7 +64,7 @@ Notifications are disabled in simulation mode and logged to serial instead.
 | Resistors ~1.6kΩ (100Ω for brighter LEDs) | 4 |
 | Push button | 1 |
 | SSD1306 0.96" OLED display (I2C) | 1 |
-| Breadboard and jumper wires | -- |
+| DHT11 temperature/humidity sensor (3 pin module) | 1 |
 
 ---
 
@@ -152,6 +152,7 @@ Install via Arduino IDE Library Manager:
 
 - [Adafruit SSD1306](https://github.com/adafruit/Adafruit_SSD1306)
 - [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library)
+- [DHT sensor library by Adafruit](https://github.com/adafruit/DHT-sensor-library)
 
 ESP32 board support via Boards Manager -- add this URL under File → Preferences:
 ```
@@ -178,6 +179,7 @@ If the upload hangs at "Connecting.....", hold the **BOOT** button on the ESP32 
 - Wokwi simulator (simulation mode)
 - Arduino IDE 2.x
 - ntfy.sh push notifications (iOS and Android)
+- DHT11 temperature and humidity sensor
 
 ---
 
