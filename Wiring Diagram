@@ -1,0 +1,103 @@
+# Woody Feed Indicator -- Wiring Guide v3
+
+## Breadboard Power Rails
+Connect these first -- everything else connects to the rails rather than directly to the ESP32.
+
+| ESP32 Pin | Breadboard Rail | Notes |
+|---|---|---|
+| 3.3V | + rail | Powers OLED and DHT11 |
+| GND | - rail | Common ground for all components |
+
+---
+
+## ESP32 Placement
+Seat the ESP32 across the centre gap of the breadboard. Ensure at least one column is free on one side for wiring.
+
+---
+
+## OLED Display (SSD1306 I2C)
+| OLED Pin | Connect To | Notes |
+|---|---|---|
+| VCC | + rail | 3.3V power |
+| GND | - rail | Ground |
+| SDA | ESP32 D21 | I2C data |
+| SCL | ESP32 D22 | I2C clock |
+
+---
+
+## DHT11 Temperature/Humidity Sensor
+Confirm pin order visually before wiring -- with sensor face towards you, typical order is VCC, DATA, GND left to right.
+
+| DHT11 Pin | Connect To | Notes |
+|---|---|---|
+| VCC | + rail | 3.3V power |
+| DATA | ESP32 D27 | Signal pin |
+| GND | - rail | Ground |
+
+---
+
+## LEDs
+Each LED has a longer leg (anode +) and a shorter leg (cathode -).
+- **Longer leg (anode)** -- connects via a resistor to the ESP32 pin
+- **Shorter leg (cathode)** -- connects to the - rail (GND)
+
+| LED | ESP32 Pin | Anode (long leg) | Cathode (short leg) |
+|---|---|---|---|
+| Green | D18 | Via 1.6kΩ resistor to D18 | - rail |
+| Red | D19 | Via 1.6kΩ resistor to D19 | - rail |
+| Orange | D25 | Via 1.6kΩ resistor to D25 | - rail |
+| Blue | D26 | Via 1.6kΩ resistor to D26 | - rail |
+
+**Resistor wiring for each LED:**
+1. Insert resistor with one leg in the same row as the ESP32 pin
+2. Insert LED anode (longer leg) in the same row as the other resistor leg
+3. Insert LED cathode (shorter leg) in a row connected to the - rail
+
+---
+
+## Push Button
+The button has four legs arranged as two pairs. Connect one leg from each side.
+
+| Button Pin | Connect To | Notes |
+|---|---|---|
+| Pin 1.l | ESP32 D4 | Signal pin |
+| Pin 2.r | - rail | Ground |
+
+> Pins 1.l and 2.r are on opposite sides of the button. Do not connect two pins from the same side.
+
+---
+
+## Pin Summary
+
+| ESP32 Pin | Component |
+|---|---|
+| 3.3V | + power rail |
+| GND | - ground rail |
+| D4 | Button |
+| D18 | Green LED (via resistor) |
+| D19 | Red LED (via resistor) |
+| D21 | OLED SDA |
+| D22 | OLED SCL |
+| D25 | Orange LED (via resistor) |
+| D26 | Blue LED (via resistor) |
+| D27 | DHT11 DATA |
+
+---
+
+## Wiring Order (Recommended)
+Following this order avoids having to redo connections:
+
+1. Connect ESP32 3.3V to + rail and GND to - rail
+2. Seat OLED and wire VCC, GND, SDA, SCL
+3. Wire DHT11 VCC, DATA, GND
+4. Wire each LED with its resistor
+5. Wire the button
+6. Double check all LED polarities before powering on
+
+---
+
+## Notes
+- The + and - rail labels on the breadboard are just convention -- what matters is that the rail connected to ESP32 3.3V is used for all VCC connections, and the rail connected to ESP32 GND is used for all ground connections
+- Do not connect anything to the ESP32 5V pin -- the OLED and DHT11 are 3.3V devices
+- If an LED does not light, try reversing it -- it is in the wrong way round
+- DHT11 pin order is not printed on all modules -- confirm visually before wiring
